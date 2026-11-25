@@ -1,0 +1,15 @@
+{
+  "name": "ooz-marks",
+  "version": "2.0.0",
+  "private": true,
+  "description": "Ooz Marks API (Vercel + Neon)",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "npm i --no-save @electric-sql/pglite && node tests/api.test.cjs"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.2.1"
+  }
+}
