@@ -35,6 +35,11 @@ const SCHEMA = [
      by_user INT, at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (term_id, student_id))`,
   `CREATE TABLE IF NOT EXISTS audit (id BIGSERIAL PRIMARY KEY, school_id INT NOT NULL REFERENCES schools(id) ON DELETE CASCADE, user_id INT, at TIMESTAMPTZ NOT NULL DEFAULT now(),
      action TEXT NOT NULL, detail JSONB NOT NULL DEFAULT '{}')`,
+  // version 2.1: the Arabic section (its own report card), subjects graded by a word, Arabic term titles
+  `ALTER TABLE classes ADD COLUMN IF NOT EXISTS section TEXT NOT NULL DEFAULT 'en'`,
+  `ALTER TABLE subjects ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'mark'`,
+  `ALTER TABLE marks ADD COLUMN IF NOT EXISTS grade TEXT`,
+  `ALTER TABLE terms ADD COLUMN IF NOT EXISTS title_ar TEXT NOT NULL DEFAULT ''`,
   `CREATE INDEX IF NOT EXISTS students_class ON students (class_id)`,
   `CREATE INDEX IF NOT EXISTS subjects_class ON subjects (class_id)`,
   `CREATE INDEX IF NOT EXISTS audit_school ON audit (school_id, at)`,

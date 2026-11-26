@@ -6,12 +6,19 @@ const { Fail } = H;
 
 const TRIAL_DAYS = 30, SESSION_DAYS = 30;
 const ROLES = ['admin', 'teacher', 'print'];
-const STAGES = ['primary', 'lower', 'secondary'];
+const STAGES = ['primary', 'lower', 'secondary'], SECTIONS = ['en', 'ar'], KINDS = ['mark', 'grade'];
 const DEFAULTS = {
   schoolName: '', curriculum: 'BRITISH CURRICULUM', footer: '', watermark: true,
   departments: { primary: 'PRIMARY DEPARTMENT', lower: 'LOWER SECONDARY DEPARTMENT', secondary: 'SECONDARY DEPARTMENT' },
   bands: [{ g: 'A*', from: 90, label: 'EXCELLENT' }, { g: 'A', from: 80, label: 'VERY GOOD' }, { g: 'B', from: 70, label: 'VERY GOOD' },
     { g: 'C', from: 60, label: 'GOOD' }, { g: 'D', from: 50, label: 'GOOD' }, { g: 'E', from: 40, label: 'SATISFACTORY' }, { g: 'F', from: 0, label: 'POOR' }],
+  // the Arabic section's report card
+  ar: {
+    lines: ['سفارة جمهورية السودان بالقاهرة – المستشارية الثقافية', ''],
+    stages: { primary: 'الابتدائية', lower: 'المتوسطة', secondary: 'الثانوية' },
+    bands: [{ from: 90, label: 'ممتاز' }, { from: 80, label: 'جيد جداً' }, { from: 65, label: 'جيد' }, { from: 50, label: 'مقبول' }, { from: 0, label: 'ضعيف' }],
+    signs: ['مشرف الصف', 'مدير المرحلة', 'مدير المدرسة'], color: '#3D5E9E', basmala: true,
+  },
   failRule: 'band', rounding: 'one', absRule: 'zero', checkComments: true, checkDuplicates: true,
   commentBank: [
     'Excellent effort and focus this term; keep up the outstanding work.',
@@ -39,6 +46,9 @@ function status(s) {
 function settingsOf(s) {
   const st = Object.assign({}, DEFAULTS, s.settings || {});
   st.departments = Object.assign({}, DEFAULTS.departments, (s.settings || {}).departments || {});
+  const ar = (s.settings || {}).ar || {};
+  st.ar = Object.assign({}, DEFAULTS.ar, ar, { stages: Object.assign({}, DEFAULTS.ar.stages, ar.stages || {}) });
+  if (!st.ar.lines[1]) st.ar.lines = [st.ar.lines[0], (st.schoolName || s.name) + ' – القسم العربي'];
   if (!st.schoolName) st.schoolName = s.name;
   return st;
 }
@@ -58,7 +68,7 @@ async function termOf(ctx, id) {
   if (!t) throw new Fail(404, 'term');
   return t;
 }
-const termOut = t => t && ({ id: t.id, name: t.name, year: t.year, current: t.is_current, locked: t.locked });
+const termOut = t => t && ({ id: t.id, name: t.name, year: t.year, titleAr: t.title_ar || '', current: t.is_current, locked: t.locked });
 function cleanSettings(b, old) {
   const s = Object.assign({}, old);
   for (const k of ['schoolName', 'curriculum', 'footer']) if (b[k] != null) s[k] = str(b[k], 200);
@@ -75,6 +85,21 @@ function cleanSettings(b, old) {
   if (['zero', 'exclude'].includes(b.absRule)) s.absRule = b.absRule;
   if (b.checkComments != null) s.checkComments = !!b.checkComments;
   if (b.checkDuplicates != null) s.checkDuplicates = !!b.checkDuplicates;
+  if (b.ar && typeof b.ar === 'object') {
+    const a = Object.assign({}, s.ar), x = b.ar;
+    if (Array.isArray(x.lines)) a.lines = [str(x.lines[0], 160), str(x.lines[1], 160)];
+    if (x.stages) { a.stages = Object.assign({}, a.stages); for (const k of STAGES) if (x.stages[k] != null) a.stages[k] = str(x.stages[k], 40); }
+    if (Array.isArray(x.bands)) {
+      const bands = x.bands.slice(0, 10).map(y => ({ from: Math.max(0, Math.min(100, Number(y.from) || 0)), label: str(y.label, 30) })).filter(y => y.label);
+      bands.sort((p, c) => c.from - p.from);
+      if (!bands.length || bands[bands.length - 1].from !== 0) throw bad('bands', 'The lowest grade must start at 0%');
+      a.bands = bands;
+    }
+    if (Array.isArray(x.signs)) a.signs = x.signs.slice(0, 4).map(y => str(y, 40)).filter(Boolean);
+    if (/^#[0-9a-fA-F]{6}$/.test(x.color || '')) a.color = x.color;
+    if (x.basmala != null) a.basmala = !!x.basmala;
+    s.ar = a;
+  }
   if (Array.isArray(b.commentBank)) s.commentBank = b.commentBank.slice(0, 200).map(x => str(x, 400)).filter(Boolean);
   return s;
 }
@@ -143,7 +168,7 @@ const OPS = {
     const ids = classes.map(c => c.id);
     const students = ids.length ? await q('SELECT * FROM students WHERE school_id=$1 AND class_id = ANY($2::int[]) ORDER BY class_id, sort, name', [sid, ids]) : [];
     const stIds = students.map(s => s.id), sbIds = subjects.map(s => s.id);
-    const marks = t && stIds.length ? await q('SELECT student_id, subject_id, value, abs FROM marks WHERE term_id=$1 AND student_id = ANY($2::int[]) AND subject_id = ANY($3::int[])', [t.id, stIds, sbIds]) : [];
+    const marks = t && stIds.length ? await q('SELECT student_id, subject_id, value, abs, grade FROM marks WHERE term_id=$1 AND student_id = ANY($2::int[]) AND subject_id = ANY($3::int[])', [t.id, stIds, sbIds]) : [];
     const ctClasses = new Set(classes.filter(c => c.class_teacher_id === me).map(c => c.id));
     const cmIds = role === 'teacher' ? students.filter(s => ctClasses.has(s.class_id)).map(s => s.id) : stIds;
     const comments = t && cmIds.length ? await q('SELECT student_id, text, returned_note FROM comments WHERE term_id=$1 AND student_id = ANY($2::int[])', [t.id, cmIds]) : [];
@@ -154,10 +179,10 @@ const OPS = {
     const printable = role === 'teacher' ? [] : approvals.map(a => a.student_id);
     return {
       term: termOut(t),
-      classes: classes.map(c => ({ id: c.id, name: c.name, stage: c.stage, classTeacherId: c.class_teacher_id, sort: c.sort })),
-      subjects: subjects.map(s => ({ id: s.id, classId: s.class_id, name: s.name, max: +s.max, min: +s.min, counted: s.counted, teacherId: s.teacher_id, sort: s.sort })),
+      classes: classes.map(c => ({ id: c.id, name: c.name, stage: c.stage, section: c.section || 'en', classTeacherId: c.class_teacher_id, sort: c.sort })),
+      subjects: subjects.map(s => ({ id: s.id, classId: s.class_id, name: s.name, max: +s.max, min: +s.min, counted: s.counted, kind: s.kind || 'mark', teacherId: s.teacher_id, sort: s.sort })),
       students: students.map(s => ({ id: s.id, classId: s.class_id, name: s.name, number: s.number, exempt: s.exempt || [], sort: s.sort })),
-      marks: marks.map(m => ({ studentId: m.student_id, subjectId: m.subject_id, value: m.value == null ? null : +m.value, abs: m.abs })),
+      marks: marks.map(m => ({ studentId: m.student_id, subjectId: m.subject_id, value: m.value == null ? null : +m.value, abs: m.abs, grade: m.grade || null })),
       comments: comments.map(c => ({ studentId: c.student_id, text: c.text, returned: c.returned_note })),
       approvals: approvals.map(a => a.student_id), submissions: subs.map(s => s.subject_id), printable,
       users: users.map(userOut),
@@ -176,10 +201,10 @@ const OPS = {
     return { settings: s };
   } },
   saveTerm: { roles: ['admin'], write: true, async run(ctx, b) {
-    const name = str(b.name, 60).toUpperCase(), year = str(b.year, 30);
+    const name = str(b.name, 60).toUpperCase(), year = str(b.year, 30), ar = str(b.titleAr, 120);
     if (!name || !year) throw bad('required');
-    if (b.id) { await termOf(ctx, b.id); await q('UPDATE terms SET name=$1, year=$2, locked=$3 WHERE id=$4', [name, year, !!b.locked, int(b.id)]); return { id: int(b.id) }; }
-    const r = await one('INSERT INTO terms (school_id, name, year) VALUES ($1,$2,$3) RETURNING id', [ctx.school.id, name, year]);
+    if (b.id) { await termOf(ctx, b.id); await q('UPDATE terms SET name=$1, year=$2, locked=$3, title_ar=$4 WHERE id=$5', [name, year, !!b.locked, ar, int(b.id)]); return { id: int(b.id) }; }
+    const r = await one('INSERT INTO terms (school_id, name, year, title_ar) VALUES ($1,$2,$3,$4) RETURNING id', [ctx.school.id, name, year, ar]);
     return { id: r.id };
   } },
   setCurrentTerm: { roles: ['admin'], write: true, async run(ctx, b) {
@@ -188,14 +213,14 @@ const OPS = {
     return { ok: true };
   } },
   saveClass: { roles: ['admin'], write: true, async run(ctx, b) {
-    const name = str(b.name, 40), stage = STAGES.includes(b.stage) ? b.stage : null;
+    const name = str(b.name, 40), stage = STAGES.includes(b.stage) ? b.stage : null, section = SECTIONS.includes(b.section) ? b.section : 'en';
     if (!name || !stage) throw bad('required');
     const ct = b.classTeacherId ? await one(`SELECT id FROM users WHERE id=$1 AND school_id=$2 AND role IN ('teacher','admin')`, [int(b.classTeacherId), ctx.school.id]) : null;
     if (b.id) {
-      const r = await one('UPDATE classes SET name=$1, stage=$2, class_teacher_id=$3, sort=$4 WHERE id=$5 AND school_id=$6 RETURNING id', [name, stage, ct && ct.id, int(b.sort), int(b.id), ctx.school.id]);
+      const r = await one('UPDATE classes SET name=$1, stage=$2, class_teacher_id=$3, sort=$4, section=$7 WHERE id=$5 AND school_id=$6 RETURNING id', [name, stage, ct && ct.id, int(b.sort), int(b.id), ctx.school.id, section]);
       if (!r) throw new Fail(404, 'class'); return { id: r.id };
     }
-    const r = await one('INSERT INTO classes (school_id, name, stage, class_teacher_id, sort) VALUES ($1,$2,$3,$4,$5) RETURNING id', [ctx.school.id, name, stage, ct && ct.id, int(b.sort)]);
+    const r = await one('INSERT INTO classes (school_id, name, stage, class_teacher_id, sort, section) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id', [ctx.school.id, name, stage, ct && ct.id, int(b.sort), section]);
     return { id: r.id };
   } },
   deleteClass: { roles: ['admin'], write: true, async run(ctx, b) {
@@ -204,15 +229,17 @@ const OPS = {
   saveSubject: { roles: ['admin'], write: true, async run(ctx, b) {
     const cls = await one('SELECT id FROM classes WHERE id=$1 AND school_id=$2', [int(b.classId), ctx.school.id]);
     if (!cls) throw new Fail(404, 'class');
-    const name = str(b.name, 60), max = num(b.max), min = num(b.min);
+    const kind = KINDS.includes(b.kind) ? b.kind : 'mark', name = str(b.name, 60);
+    let max = num(b.max), min = num(b.min);
+    if (kind === 'grade') { max = 1; min = 0; }   // graded by a word: no mark, not in the total
     if (!name || !(max > 0) || !(min >= 0) || min > max) throw bad('subject');
     const t = b.teacherId ? await one(`SELECT id FROM users WHERE id=$1 AND school_id=$2 AND role IN ('teacher','admin')`, [int(b.teacherId), ctx.school.id]) : null;
-    const v = [name, max, min, b.counted !== false, t && t.id, int(b.sort)];
+    const v = [name, max, min, b.counted !== false, t && t.id, int(b.sort), kind];
     if (b.id) {
-      const r = await one('UPDATE subjects SET name=$1, max=$2, min=$3, counted=$4, teacher_id=$5, sort=$6 WHERE id=$7 AND school_id=$8 RETURNING id', [...v, int(b.id), ctx.school.id]);
+      const r = await one('UPDATE subjects SET name=$1, max=$2, min=$3, counted=$4, teacher_id=$5, sort=$6, kind=$7 WHERE id=$8 AND school_id=$9 RETURNING id', [...v, int(b.id), ctx.school.id]);
       if (!r) throw new Fail(404, 'subject'); return { id: r.id };
     }
-    const r = await one('INSERT INTO subjects (name, max, min, counted, teacher_id, sort, school_id, class_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id', [...v, ctx.school.id, cls.id]);
+    const r = await one('INSERT INTO subjects (name, max, min, counted, teacher_id, sort, kind, school_id, class_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id', [...v, ctx.school.id, cls.id]);
     return { id: r.id };
   } },
   deleteSubject: { roles: ['admin'], write: true, async run(ctx, b) {
@@ -224,7 +251,7 @@ const OPS = {
     const have = new Set((await q('SELECT lower(name) AS n FROM subjects WHERE class_id=$1', [to.id])).map(r => r.n));
     const src = await q('SELECT * FROM subjects WHERE class_id=$1 ORDER BY sort, id', [from.id]);
     let n = 0;
-    for (const s of src) if (!have.has(s.name.toLowerCase())) { await q('INSERT INTO subjects (school_id, class_id, name, max, min, counted, sort) VALUES ($1,$2,$3,$4,$5,$6,$7)', [ctx.school.id, to.id, s.name, s.max, s.min, s.counted, s.sort]); n++; }
+    for (const s of src) if (!have.has(s.name.toLowerCase())) { await q('INSERT INTO subjects (school_id, class_id, name, max, min, counted, sort, kind) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [ctx.school.id, to.id, s.name, s.max, s.min, s.counted, s.sort, s.kind || 'mark']); n++; }
     return { added: n };
   } },
   saveUser: { roles: ['admin'], write: true, async run(ctx, b) {
@@ -312,12 +339,14 @@ const OPS = {
       const st = studs.get(int(e.studentId)); if (!st) throw bad('student');
       if ((st.exempt || []).includes(sub.id)) continue;
       if (approved.has(st.id) && !admin) throw new Fail(409, 'approved');
-      const abs = !!e.abs, v = abs ? null : num(e.value);
+      const abs = !!e.abs, word = sub.kind === 'grade';
+      const v = abs || word ? null : num(e.value), g = abs || !word ? null : (str(e.grade, 30) || null);
       if (Number.isNaN(v) || (v != null && (v < 0 || v > +sub.max))) throw new Fail(400, 'range', String(e.value));
-      const before = admin ? await one('SELECT value, abs FROM marks WHERE term_id=$1 AND student_id=$2 AND subject_id=$3', [t.id, st.id, sub.id]) : null;
-      await q(`INSERT INTO marks (term_id, student_id, subject_id, value, abs, updated_by, updated_at) VALUES ($1,$2,$3,$4,$5,$6,now())
-        ON CONFLICT (term_id, student_id, subject_id) DO UPDATE SET value=EXCLUDED.value, abs=EXCLUDED.abs, updated_by=EXCLUDED.updated_by, updated_at=now()`, [t.id, st.id, sub.id, v, abs, ctx.user.id]);
-      if (admin) await audit(ctx, 'mark', { term: t.id, student: st.id, subject: sub.id, from: before ? (before.abs ? 'Abs' : (before.value == null ? null : +before.value)) : null, to: abs ? 'Abs' : v });
+      const before = admin ? await one('SELECT value, abs, grade FROM marks WHERE term_id=$1 AND student_id=$2 AND subject_id=$3', [t.id, st.id, sub.id]) : null;
+      await q(`INSERT INTO marks (term_id, student_id, subject_id, value, abs, grade, updated_by, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,now())
+        ON CONFLICT (term_id, student_id, subject_id) DO UPDATE SET value=EXCLUDED.value, abs=EXCLUDED.abs, grade=EXCLUDED.grade, updated_by=EXCLUDED.updated_by, updated_at=now()`, [t.id, st.id, sub.id, v, abs, g, ctx.user.id]);
+      const was = before ? (before.abs ? 'Abs' : before.grade || (before.value == null ? null : +before.value)) : null;
+      if (admin) await audit(ctx, 'mark', { term: t.id, student: st.id, subject: sub.id, from: was, to: abs ? 'Abs' : word ? g : v });
       n++;
     }
     return { saved: n };
@@ -327,7 +356,7 @@ const OPS = {
     const sub = await one('SELECT * FROM subjects WHERE id=$1 AND school_id=$2', [int(b.subjectId), ctx.school.id]);
     if (!sub || (ctx.user.role !== 'admin' && sub.teacher_id !== ctx.user.id)) throw new Fail(403, 'not_yours');
     const missing = await one(`SELECT count(*)::int AS n FROM students s WHERE s.class_id=$1 AND NOT (s.exempt @> to_jsonb($2::int))
-      AND NOT EXISTS (SELECT 1 FROM marks m WHERE m.term_id=$3 AND m.student_id=s.id AND m.subject_id=$2 AND (m.abs OR m.value IS NOT NULL))`, [sub.class_id, sub.id, t.id]);
+      AND NOT EXISTS (SELECT 1 FROM marks m WHERE m.term_id=$3 AND m.student_id=s.id AND m.subject_id=$2 AND (m.abs OR m.value IS NOT NULL OR m.grade IS NOT NULL))`, [sub.class_id, sub.id, t.id]);
     if (missing.n) throw new Fail(409, 'missing', String(missing.n));
     await q('INSERT INTO submissions (term_id, subject_id, by_user) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [t.id, sub.id, ctx.user.id]);
     return { ok: true };
