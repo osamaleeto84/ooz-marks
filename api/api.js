@@ -52,7 +52,14 @@ function settingsOf(s) {
   if (!st.schoolName) st.schoolName = s.name;
   return st;
 }
-const userOut = u => ({ id: u.id, username: u.username, name: u.name, role: u.role, active: u.active, mustChange: u.must_change });
+const userOut = u => ({ id: u.id, username: u.username, name: u.name, role: u.role, active: u.active, mustChange: u.must_change, scope: scopeOf(u) });
+/* A principal's scope: none = the system principal (everything); a section (en/ar) and, if given, some of its stages. */
+const scopeOf = u => { const x = u.scope || {}; if (u.role !== 'admin' || !SECTIONS.includes(x.section)) return {}; return { section: x.section, stages: (Array.isArray(x.stages) ? x.stages : []).filter(k => STAGES.includes(k)) }; };
+const normScope = (role, x) => scopeOf({ role, scope: x || {} });
+const scoped = u => !!scopeOf(u).section;
+const inScope = (u, c) => { const x = scopeOf(u); return !x.section || ((c.section || 'en') === x.section && (!x.stages.length || x.stages.includes(c.stage))); };
+async function scopeClass(ctx, classId) { if (!scoped(ctx.user)) return; const c = await one('SELECT section, stage FROM classes WHERE id=$1 AND school_id=$2', [int(classId), ctx.school.id]); if (!c || !inScope(ctx.user, c)) throw new Fail(403, 'scope'); }
+async function scopeStudents(ctx, ids) { const r = await q('SELECT s.id, c.section, c.stage FROM students s JOIN classes c ON c.id=s.class_id WHERE s.school_id=$1 AND s.id = ANY($2::int[])', [ctx.school.id, ids]); return r.filter(x => inScope(ctx.user, x)).map(x => x.id); }
 async function audit(ctx, action, detail) { await q('INSERT INTO audit (school_id, user_id, action, detail) VALUES ($1,$2,$3,$4::jsonb)', [ctx.school.id, ctx.user.id, action, JSON.stringify(detail || {})]); }
 async function session(user) {
   const t = H.token();
@@ -159,6 +166,7 @@ const OPS = {
     const sid = ctx.school.id, role = ctx.user.role, me = ctx.user.id;
     let classes = await q('SELECT * FROM classes WHERE school_id=$1 ORDER BY sort, id', [sid]);
     let subjects = await q('SELECT * FROM subjects WHERE school_id=$1 ORDER BY sort, id', [sid]);
+    if (scoped(ctx.user)) { classes = classes.filter(c => inScope(ctx.user, c)); const ok = new Set(classes.map(c => c.id)); subjects = subjects.filter(s => ok.has(s.class_id)); }
     if (role === 'teacher') {
       const mine = new Set(subjects.filter(s => s.teacher_id === me).map(s => s.class_id));
       classes.filter(c => c.class_teacher_id === me).forEach(c => mine.add(c.id));
@@ -174,7 +182,7 @@ const OPS = {
     const comments = t && cmIds.length ? await q('SELECT student_id, text, returned_note FROM comments WHERE term_id=$1 AND student_id = ANY($2::int[])', [t.id, cmIds]) : [];
     const approvals = t && stIds.length ? await q('SELECT student_id, at FROM approvals WHERE term_id=$1 AND student_id = ANY($2::int[])', [t.id, stIds]) : [];
     const subs = t && sbIds.length ? await q('SELECT subject_id, at FROM submissions WHERE term_id=$1 AND subject_id = ANY($2::int[])', [t.id, sbIds]) : [];
-    const users = role === 'admin' ? await q('SELECT * FROM users WHERE school_id=$1 ORDER BY role, name', [sid])
+    const users = role === 'admin' && !scoped(ctx.user) ? await q('SELECT * FROM users WHERE school_id=$1 ORDER BY role, name', [sid])
       : await q('SELECT id, name, role, username, active, must_change FROM users WHERE school_id=$1 AND (id = ANY($2::int[]))', [sid, [...new Set([me, ...subjects.map(s => s.teacher_id), ...classes.map(c => c.class_teacher_id)].filter(Boolean))]]);
     const printable = role === 'teacher' ? [] : approvals.map(a => a.student_id);
     return {
@@ -190,7 +198,7 @@ const OPS = {
   } },
 
   // ----- admin: school, terms, classes, subjects, accounts, students -----
-  saveSettings: { roles: ['admin'], write: true, async run(ctx, b) {
+  saveSettings: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const s = cleanSettings(b.settings || {}, settingsOf(ctx.school));
     await q('UPDATE schools SET settings=$1::jsonb WHERE id=$2', [JSON.stringify(s), ctx.school.id]);
     if (b.logo != null) {
@@ -200,19 +208,19 @@ const OPS = {
     }
     return { settings: s };
   } },
-  saveTerm: { roles: ['admin'], write: true, async run(ctx, b) {
+  saveTerm: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const name = str(b.name, 60).toUpperCase(), year = str(b.year, 30), ar = str(b.titleAr, 120);
     if (!name || !year) throw bad('required');
     if (b.id) { await termOf(ctx, b.id); await q('UPDATE terms SET name=$1, year=$2, locked=$3, title_ar=$4 WHERE id=$5', [name, year, !!b.locked, ar, int(b.id)]); return { id: int(b.id) }; }
     const r = await one('INSERT INTO terms (school_id, name, year, title_ar) VALUES ($1,$2,$3,$4) RETURNING id', [ctx.school.id, name, year, ar]);
     return { id: r.id };
   } },
-  setCurrentTerm: { roles: ['admin'], write: true, async run(ctx, b) {
+  setCurrentTerm: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const t = await termOf(ctx, b.id);
     await q('UPDATE terms SET is_current = (id=$1) WHERE school_id=$2', [t.id, ctx.school.id]);
     return { ok: true };
   } },
-  saveClass: { roles: ['admin'], write: true, async run(ctx, b) {
+  saveClass: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const name = str(b.name, 40), stage = STAGES.includes(b.stage) ? b.stage : null, section = SECTIONS.includes(b.section) ? b.section : 'en';
     if (!name || !stage) throw bad('required');
     const ct = b.classTeacherId ? await one(`SELECT id FROM users WHERE id=$1 AND school_id=$2 AND role IN ('teacher','admin')`, [int(b.classTeacherId), ctx.school.id]) : null;
@@ -223,10 +231,10 @@ const OPS = {
     const r = await one('INSERT INTO classes (school_id, name, stage, class_teacher_id, sort, section) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id', [ctx.school.id, name, stage, ct && ct.id, int(b.sort), section]);
     return { id: r.id };
   } },
-  deleteClass: { roles: ['admin'], write: true, async run(ctx, b) {
+  deleteClass: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     await q('DELETE FROM classes WHERE id=$1 AND school_id=$2', [int(b.id), ctx.school.id]); await audit(ctx, 'deleteClass', { id: int(b.id) }); return { ok: true };
   } },
-  saveSubject: { roles: ['admin'], write: true, async run(ctx, b) {
+  saveSubject: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const cls = await one('SELECT id FROM classes WHERE id=$1 AND school_id=$2', [int(b.classId), ctx.school.id]);
     if (!cls) throw new Fail(404, 'class');
     const kind = KINDS.includes(b.kind) ? b.kind : 'mark', name = str(b.name, 60);
@@ -242,10 +250,10 @@ const OPS = {
     const r = await one('INSERT INTO subjects (name, max, min, counted, teacher_id, sort, kind, school_id, class_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id', [...v, ctx.school.id, cls.id]);
     return { id: r.id };
   } },
-  deleteSubject: { roles: ['admin'], write: true, async run(ctx, b) {
+  deleteSubject: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     await q('DELETE FROM subjects WHERE id=$1 AND school_id=$2', [int(b.id), ctx.school.id]); await audit(ctx, 'deleteSubject', { id: int(b.id) }); return { ok: true };
   } },
-  copySubjects: { roles: ['admin'], write: true, async run(ctx, b) {
+  copySubjects: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const from = await one('SELECT id FROM classes WHERE id=$1 AND school_id=$2', [int(b.fromId), ctx.school.id]), to = await one('SELECT id FROM classes WHERE id=$1 AND school_id=$2', [int(b.toId), ctx.school.id]);
     if (!from || !to || from.id === to.id) throw new Fail(404, 'class');
     const have = new Set((await q('SELECT lower(name) AS n FROM subjects WHERE class_id=$1', [to.id])).map(r => r.n));
@@ -254,32 +262,33 @@ const OPS = {
     for (const s of src) if (!have.has(s.name.toLowerCase())) { await q('INSERT INTO subjects (school_id, class_id, name, max, min, counted, sort, kind) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [ctx.school.id, to.id, s.name, s.max, s.min, s.counted, s.sort, s.kind || 'mark']); n++; }
     return { added: n };
   } },
-  saveUser: { roles: ['admin'], write: true, async run(ctx, b) {
+  saveUser: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const name = str(b.name, 80), username = str(b.username, 40).toLowerCase(), role = ROLES.includes(b.role) ? b.role : null;
     if (!name || !role) throw bad('required');
     if (!/^[a-z0-9._-]{3,40}$/.test(username)) throw bad('username');
     try {
       if (b.id) {
         const id = int(b.id);
-        if (id === ctx.user.id && (role !== 'admin' || b.active === false)) throw bad('self');
-        const r = await one('UPDATE users SET name=$1, username=$2, role=$3, active=$4 WHERE id=$5 AND school_id=$6 RETURNING *', [name, username, role, b.active !== false, id, ctx.school.id]);
+        const scope = normScope(role, b.scope);
+        if (id === ctx.user.id && (role !== 'admin' || b.active === false || scope.section)) throw bad('self');
+        const r = await one('UPDATE users SET name=$1, username=$2, role=$3, active=$4, scope=$7::jsonb WHERE id=$5 AND school_id=$6 RETURNING *', [name, username, role, b.active !== false, id, ctx.school.id, JSON.stringify(scope)]);
         if (!r) throw new Fail(404, 'user');
         if (b.active === false) await q('DELETE FROM sessions WHERE user_id=$1', [id]);
         return { user: userOut(r) };
       }
       const pw = H.code(8);
-      const r = await one('INSERT INTO users (school_id, username, name, role, pass_hash, must_change) VALUES ($1,$2,$3,$4,$5,true) RETURNING *', [ctx.school.id, username, name, role, H.hashPassword(pw)]);
+      const r = await one('INSERT INTO users (school_id, username, name, role, pass_hash, must_change, scope) VALUES ($1,$2,$3,$4,$5,true,$6::jsonb) RETURNING *', [ctx.school.id, username, name, role, H.hashPassword(pw), JSON.stringify(normScope(role, b.scope))]);
       return { user: userOut(r), password: pw };
     } catch (e) { if (/duplicate|unique/i.test(e.message)) throw new Fail(409, 'username_taken'); throw e; }
   } },
-  resetPassword: { roles: ['admin'], write: true, async run(ctx, b) {
+  resetPassword: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const pw = H.code(8);
     const r = await one('UPDATE users SET pass_hash=$1, must_change=true WHERE id=$2 AND school_id=$3 RETURNING id', [H.hashPassword(pw), int(b.id), ctx.school.id]);
     if (!r) throw new Fail(404, 'user');
     await q('DELETE FROM sessions WHERE user_id=$1', [r.id]);
     return { password: pw };
   } },
-  saveStudent: { roles: ['admin'], write: true, async run(ctx, b) {
+  saveStudent: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const cls = await one('SELECT id FROM classes WHERE id=$1 AND school_id=$2', [int(b.classId), ctx.school.id]);
     if (!cls) throw new Fail(404, 'class');
     const name = str(b.name, 120); if (!name) throw bad('required');
@@ -291,11 +300,11 @@ const OPS = {
     const r = await one('INSERT INTO students (school_id, class_id, name, number, exempt, sort) VALUES ($1,$2,$3,$4,$5::jsonb,$6) RETURNING id', [ctx.school.id, cls.id, name, str(b.number, 30), JSON.stringify(exempt), int(b.sort)]);
     return { id: r.id };
   } },
-  deleteStudent: { roles: ['admin'], write: true, async run(ctx, b) {
+  deleteStudent: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     await q('DELETE FROM students WHERE id=$1 AND school_id=$2', [int(b.id), ctx.school.id]); await audit(ctx, 'deleteStudent', { id: int(b.id) }); return { ok: true };
   } },
   // Rows already checked on the device; checked again here. Nothing is written if any row is wrong.
-  importStudents: { roles: ['admin'], write: true, async run(ctx, b) {
+  importStudents: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
     const rows = Array.isArray(b.rows) ? b.rows.slice(0, 3000) : [];
     const classes = await q('SELECT id, name FROM classes WHERE school_id=$1', [ctx.school.id]);
     const subjects = await q('SELECT id, class_id, name FROM subjects WHERE school_id=$1', [ctx.school.id]);
@@ -325,7 +334,7 @@ const OPS = {
     const t = await termOf(ctx, b.termId);
     const sub = await one('SELECT * FROM subjects WHERE id=$1 AND school_id=$2', [int(b.subjectId), ctx.school.id]);
     if (!sub) throw new Fail(404, 'subject');
-    const admin = ctx.user.role === 'admin';
+    const admin = ctx.user.role === 'admin'; if (admin) await scopeClass(ctx, sub.class_id);
     if (!admin) {
       if (sub.teacher_id !== ctx.user.id) throw new Fail(403, 'not_yours');
       if (t.locked) throw new Fail(409, 'term_locked');
@@ -355,6 +364,7 @@ const OPS = {
     const t = await termOf(ctx, b.termId);
     const sub = await one('SELECT * FROM subjects WHERE id=$1 AND school_id=$2', [int(b.subjectId), ctx.school.id]);
     if (!sub || (ctx.user.role !== 'admin' && sub.teacher_id !== ctx.user.id)) throw new Fail(403, 'not_yours');
+    if (ctx.user.role === 'admin') await scopeClass(ctx, sub.class_id);
     const missing = await one(`SELECT count(*)::int AS n FROM students s WHERE s.class_id=$1 AND NOT (s.exempt @> to_jsonb($2::int))
       AND NOT EXISTS (SELECT 1 FROM marks m WHERE m.term_id=$3 AND m.student_id=s.id AND m.subject_id=$2 AND (m.abs OR m.value IS NOT NULL OR m.grade IS NOT NULL))`, [sub.class_id, sub.id, t.id]);
     if (missing.n) throw new Fail(409, 'missing', String(missing.n));
@@ -363,6 +373,7 @@ const OPS = {
   } },
   reopenMarks: { roles: ['admin'], write: true, async run(ctx, b) {
     const t = await termOf(ctx, b.termId);
+    const sub = await one('SELECT class_id FROM subjects WHERE id=$1 AND school_id=$2', [int(b.subjectId), ctx.school.id]); if (sub) await scopeClass(ctx, sub.class_id);
     await q('DELETE FROM submissions WHERE term_id=$1 AND subject_id IN (SELECT id FROM subjects WHERE id=$2 AND school_id=$3)', [t.id, int(b.subjectId), ctx.school.id]);
     await audit(ctx, 'reopen', { term: t.id, subject: int(b.subjectId) });
     return { ok: true };
@@ -373,6 +384,7 @@ const OPS = {
     const t = await termOf(ctx, b.termId);
     const st = await one('SELECT s.id, c.class_teacher_id FROM students s JOIN classes c ON c.id=s.class_id WHERE s.id=$1 AND s.school_id=$2', [int(b.studentId), ctx.school.id]);
     if (!st) throw new Fail(404, 'student');
+    if (ctx.user.role === 'admin' && !(await scopeStudents(ctx, [st.id])).length) throw new Fail(403, 'scope');
     if (ctx.user.role !== 'admin') {
       if (st.class_teacher_id !== ctx.user.id) throw new Fail(403, 'not_yours');
       if (t.locked) throw new Fail(409, 'term_locked');
@@ -385,7 +397,7 @@ const OPS = {
   returnComment: { roles: ['admin'], write: true, async run(ctx, b) {
     const t = await termOf(ctx, b.termId);
     const st = await one('SELECT id FROM students WHERE id=$1 AND school_id=$2', [int(b.studentId), ctx.school.id]);
-    if (!st) throw new Fail(404, 'student');
+    if (!st || !(await scopeStudents(ctx, [st.id])).length) throw new Fail(404, 'student');
     await q(`INSERT INTO comments (term_id, student_id, text, returned_note) VALUES ($1,$2,'',$3)
       ON CONFLICT (term_id, student_id) DO UPDATE SET returned_note=EXCLUDED.returned_note`, [t.id, st.id, str(b.note, 300) || '-']);
     await q('DELETE FROM approvals WHERE term_id=$1 AND student_id=$2', [t.id, st.id]);
@@ -394,22 +406,22 @@ const OPS = {
   approve: { roles: ['admin'], write: true, async run(ctx, b) {
     const t = await termOf(ctx, b.termId);
     const ids = (Array.isArray(b.studentIds) ? b.studentIds : []).map(int).slice(0, 2000);
-    const own = (await q('SELECT id FROM students WHERE school_id=$1 AND id = ANY($2::int[])', [ctx.school.id, ids])).map(r => r.id);
+    const own = await scopeStudents(ctx, ids);
     for (const id of own) await q('INSERT INTO approvals (term_id, student_id, by_user) VALUES ($1,$2,$3) ON CONFLICT DO NOTHING', [t.id, id, ctx.user.id]);
     await audit(ctx, 'approve', { term: t.id, count: own.length });
     return { approved: own.length };
   } },
   unapprove: { roles: ['admin'], write: true, async run(ctx, b) {
     const t = await termOf(ctx, b.termId);
-    const ids = (Array.isArray(b.studentIds) ? b.studentIds : []).map(int);
+    const ids = await scopeStudents(ctx, (Array.isArray(b.studentIds) ? b.studentIds : []).map(int));
     await q('DELETE FROM approvals WHERE term_id=$1 AND student_id IN (SELECT id FROM students WHERE school_id=$2 AND id = ANY($3::int[]))', [t.id, ctx.school.id, ids]);
     return { ok: true };
   } },
-  auditLog: { roles: ['admin'], async run(ctx) {
+  auditLog: { roles: ['admin'], sys: true, async run(ctx) {
     const r = await q(`SELECT a.at, a.action, a.detail, u.name FROM audit a LEFT JOIN users u ON u.id=a.user_id WHERE a.school_id=$1 ORDER BY a.at DESC LIMIT 200`, [ctx.school.id]);
     return { items: r.map(x => ({ at: x.at, action: x.action, detail: x.detail, by: x.name })) };
   } },
-  activate: { roles: ['admin'], async run(ctx, b) {
+  activate: { roles: ['admin'], sys: true, async run(ctx, b) {
     const r = verifyLicence(ctx.school.code, b.key);
     if (!r) throw new Fail(400, 'licence');
     await q('UPDATE schools SET license_until=$1 WHERE id=$2', [r, ctx.school.id]);
@@ -469,7 +481,7 @@ module.exports = async (req, res) => {
       FROM sessions x JOIN users u ON u.id=x.user_id JOIN schools s ON s.id=u.school_id WHERE x.token_hash=$1 AND x.expires > now() AND u.active`, [th]);
     if (!row) throw new Fail(401, 'auth');
     const ctx = { tokenHash: th, user: row, school: { id: row.sid, code: row.code, name: row.sname, settings: row.settings, logo: row.logo, trial_ends: row.trial_ends, license_until: row.license_until } };
-    if (!def.roles.includes(row.role)) throw new Fail(403, 'role');
+    if (!def.roles.includes(row.role) || (def.sys && scoped(row))) throw new Fail(403, 'role');
     if (def.write && status(ctx.school).state === 'expired') throw new Fail(402, 'expired');
     if (row.must_change && !['me', 'logout', 'changePassword'].includes(op)) throw new Fail(403, 'must_change');
     H.send(res, 200, await def.run(ctx, b));

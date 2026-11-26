@@ -40,6 +40,7 @@ const SCHEMA = [
   `ALTER TABLE subjects ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'mark'`,
   `ALTER TABLE marks ADD COLUMN IF NOT EXISTS grade TEXT`,
   `ALTER TABLE terms ADD COLUMN IF NOT EXISTS title_ar TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS scope JSONB NOT NULL DEFAULT '{}'::jsonb`,
   `CREATE INDEX IF NOT EXISTS students_class ON students (class_id)`,
   `CREATE INDEX IF NOT EXISTS subjects_class ON subjects (class_id)`,
   `CREATE INDEX IF NOT EXISTS audit_school ON audit (school_id, at)`,
