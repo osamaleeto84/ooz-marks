@@ -1,7 +1,7 @@
 /* Ooz Marks — students' results: principal dashboard, teachers' marks, class teachers' comments, review, approval, printing. */
 (function () {
 'use strict';
-const VERSION = '2.5.0';
+const VERSION = '2.6.0';
 const API_DEFAULT = 'https://ooz-marks.vercel.app';
 const $ = (s, r) => (r || document).querySelector(s), $$ = (s, r) => [...(r || document).querySelectorAll(s)];
 const E = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -572,6 +572,7 @@ SCREENS.settings = async () => {
     '<b style="font-size:14px">' + t('الغائب (Abs) — تظهر Abs مكان الدرجة في الشهادة', 'Absent (Abs) — the report shows Abs in place of the mark') + '</b>' + radio('abs', [['zero', 'تُحسب درجته صفراً في المجموع', 'Counts as zero in the total'], ['exclude', 'لا تُحسب المادة في مجموعه', 'Subject left out of the total']], st.absRule) + '</section>' +
     '<section class="c pad col"><h2>' + t('التعليقات', 'Comments') + '</h2><label class="check"><input type="checkbox" id="chk"' + (st.checkComments ? ' checked' : '') + '><span>' + t('تنبيه إذا تعارض التعليق مع الدرجات أو ذكر اسم طالب آخر', 'Warn when a comment contradicts the marks or names another student') + '</span></label><label class="check"><input type="checkbox" id="dup"' + (st.checkDuplicates ? ' checked' : '') + '><span>' + t('تنبيه إذا تكرر نفس التعليق لأكثر من طالب', 'Warn when the same comment is used twice') + '</span></label>' +
     '<div class="f"><label for="bank">' + t('بنك التعليقات (جملة في كل سطر)', 'Comment bank (one sentence per line)') + '</label><textarea id="bank" dir="ltr" rows="7">' + E(st.commentBank.join('\n')) + '</textarea></div></section>' +
+    '<section class="c pad col"><h2>' + t('بيانات المدرسة لبرامج Ooz', 'School data for the Ooz programs') + '</h2><span class="mu" style="font-size:13px;line-height:1.7">' + t('ملف واحد ينقل الفصول والمواد والمعلمين والطلاب (والنتائج) بين Ooz Marks و Timetable Studio و School Manager. الاستيراد يضيف ويحدّث فقط.', 'One file moves classes, subjects, teachers and students (and results) between Ooz Marks, Timetable Studio and School Manager. Importing only adds and updates.') + '</span><div class="row"><button class="btn" id="suiteOut">' + ic('down', 's') + t('تصدير بيانات المدرسة', 'Export school data') + '</button><button class="btn g" id="suiteIn">' + ic('up', 's') + t('استيراد بيانات المدرسة', 'Import school data') + '</button></div></section>' +
     '<section class="c pad col" style="background:var(--side);border-color:var(--side);color:#FBEEE2"><h2 style="color:#F5C451">' + t('الترخيص', 'Licence') + '</h2><span>' + (stt.state === 'licensed' ? t('مفعّل حتى ', 'Active until ') + new Date(stt.until).toLocaleDateString(ar() ? 'ar-EG-u-nu-latn' : 'en-GB') : stt.state === 'trial' ? t('نسخة تجريبية كاملة: باقٍ ' + stt.daysLeft + ' يوماً من 30', 'Full trial: ' + stt.daysLeft + ' of 30 days left') : t('انتهت التجربة: النظام للعرض فقط', 'Trial ended: view only')) + '</span>' +
     '<span style="color:#D9CFC2;font-size:13px;line-height:1.7">' + t('رمز مدرستك: ', 'Your school code: ') + '<b class="en" style="color:#F5C451">' + E(me.school.code) + '</b>. ' + t('للتفعيل تواصل مع Ooz apps على واتساب ‎+249 91 260 6138‎ وأرسل هذا الرمز.', 'To activate, contact Ooz apps on WhatsApp +249 91 260 6138 with this code.') + '</span>' +
     '<div class="col" style="gap:6px;padding:10px 12px;border-radius:12px;background:#211F1C"><span style="color:#D9CFC2;font-size:13px">' + t('رابط الدخول من المتصفح (آيفون، ماك، أي جهاز بلا تطبيق):', 'Sign-in link for a browser (iPhone, Mac, any device without the app):') + '</span>' +
@@ -596,6 +597,7 @@ SCREENS.settings = async () => {
     $$('[data-cur]', m).forEach(b => b.onclick = async () => { await run(() => api('setCurrentTerm', { id: +b.dataset.cur }), t('تم', 'Done')); await reloadMe(); await load(); render(); });
     $$('[data-term]', m).forEach(b => b.onclick = () => termDialog(terms.find(x => x.id === +b.dataset.term)));
     $('#addterm', m).onclick = () => termDialog(null);
+    $('#suiteOut', m).onclick = () => go('suite', { view: 'export' }); $('#suiteIn', m).onclick = () => go('suite', { view: 'import', fresh: true });
     const wl = $('#wlink', m); if (wl) wl.onclick = async () => { const ok = await N.copy(webLink(D.me.school.code)); toast(ok === false ? webLink(D.me.school.code) : t('تم نسخ الرابط', 'Link copied')); };
     $('#act', m).onclick = async () => { const k = $('#lk', m).value.trim(); if (!k) return; await run(() => api('activate', { key: k }), t('تم التفعيل. شكراً لك', 'Activated. Thank you')); await reloadMe(); render(); };
     $('#pw', m).onclick = () => showPassword(false); $('#out', m).onclick = logout; $('#log', m).onclick = auditDialog;
@@ -636,6 +638,7 @@ function toPng(dataURL, max) {
 }
 
 /* ---------- teachers ---------- */
+SCREENS.suite = async p => (SCREENS._su = SCREENS._su || OozSuiteInit({ D, t, E, ic, api, render, $, $$, run, toast, N: window.N, go, dialog, confirmBox, load, tab, VERSION, schoolName: () => ST().schoolName || D.me.school.name }))(p);
 SCREENS.analysis = async p => (SCREENS._an = SCREENS._an || OozAnalysisInit({ D, t, E, ic, ST, api, render, $, $$, run, toast, N: window.N, stageOf, termLabel, nameOf, fileSafe }))(p);
 SCREENS.mine = async () => {
   const d = D.data, me = D.me.user.id, mine = d.subjects.filter(s => s.teacherId === me), cts = d.classes.filter(c => c.classTeacherId === me && !isAr(c));
