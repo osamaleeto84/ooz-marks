@@ -41,6 +41,13 @@ const SCHEMA = [
   `ALTER TABLE marks ADD COLUMN IF NOT EXISTS grade TEXT`,
   `ALTER TABLE terms ADD COLUMN IF NOT EXISTS title_ar TEXT NOT NULL DEFAULT ''`,
   `ALTER TABLE users ADD COLUMN IF NOT EXISTS scope JSONB NOT NULL DEFAULT '{}'::jsonb`,
+  // version 2.6: the Ooz School Suite file (.oozschool): each record keeps the uid it came with; every import can be undone
+  `ALTER TABLE classes ADD COLUMN IF NOT EXISTS uid TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE subjects ADD COLUMN IF NOT EXISTS uid TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE users ADD COLUMN IF NOT EXISTS uid TEXT NOT NULL DEFAULT ''`,
+  `ALTER TABLE students ADD COLUMN IF NOT EXISTS uid TEXT NOT NULL DEFAULT ''`,
+  `CREATE TABLE IF NOT EXISTS suite_imports (id SERIAL PRIMARY KEY, school_id INT NOT NULL REFERENCES schools(id) ON DELETE CASCADE, user_id INT, at TIMESTAMPTZ NOT NULL DEFAULT now(),
+     undo JSONB NOT NULL DEFAULT '{}', undone BOOLEAN NOT NULL DEFAULT false)`,
   `CREATE INDEX IF NOT EXISTS students_class ON students (class_id)`,
   `CREATE INDEX IF NOT EXISTS subjects_class ON subjects (class_id)`,
   `CREATE INDEX IF NOT EXISTS audit_school ON audit (school_id, at)`,

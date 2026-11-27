@@ -328,6 +328,124 @@ const OPS = {
     return { added: ready.length, errors: [] };
   } },
 
+  // ----- Ooz School Suite: the .oozschool file shared with Ooz Timetable Studio and Ooz School Manager (2.6) -----
+  // The device builds and reads the file; the server hands over the school's rows and applies a reviewed list of changes.
+  suiteExport: { roles: ['admin'], sys: true, async run(ctx, b) {
+    const sid = ctx.school.id, st = settingsOf(ctx.school), t = await currentTerm(sid);
+    const classes = await q('SELECT id, name, stage, section, uid, sort FROM classes WHERE school_id=$1 ORDER BY sort, id', [sid]);
+    const subjects = await q('SELECT id, class_id, name, max, kind, teacher_id, uid, sort FROM subjects WHERE school_id=$1 ORDER BY sort, id', [sid]);
+    const used = new Set(subjects.map(s => s.teacher_id).filter(Boolean));
+    const users = (await q('SELECT id, name, role, uid, active FROM users WHERE school_id=$1 ORDER BY name', [sid])).filter(u => u.role === 'teacher' || used.has(u.id));
+    const students = await q('SELECT id, class_id, name, number, uid FROM students WHERE school_id=$1 ORDER BY class_id, sort, name', [sid]);
+    let terms = [], marks = [];
+    if (b.results) {
+      terms = await q('SELECT id, name, title_ar, year FROM terms WHERE school_id=$1 ORDER BY id', [sid]);
+      marks = await q('SELECT m.term_id, m.student_id, m.subject_id, m.value, m.abs, m.grade FROM marks m JOIN students s ON s.id=m.student_id WHERE s.school_id=$1', [sid]);
+    }
+    return {
+      school: { name: st.schoolName || ctx.school.name, logo: ctx.school.logo || '', year: t ? t.year : '' },
+      classes: classes.map(c => ({ id: c.id, name: c.name, stage: c.stage, section: c.section || 'en', uid: c.uid })),
+      subjects: subjects.map(s => ({ id: s.id, classId: s.class_id, name: s.name, max: +s.max, kind: s.kind || 'mark', teacherId: s.teacher_id, uid: s.uid })),
+      teachers: users.map(u => ({ id: u.id, name: u.name, uid: u.uid, active: u.active })),
+      students: students.map(s => ({ id: s.id, classId: s.class_id, name: s.name, number: s.number, uid: s.uid })),
+      terms: terms.map(x => ({ id: x.id, name: x.name, titleAr: x.title_ar, year: x.year })),
+      marks: marks.map(m => ({ termId: m.term_id, studentId: m.student_id, subjectId: m.subject_id, value: m.value == null ? null : +m.value, abs: m.abs, grade: m.grade || null })),
+    };
+  } },
+  suiteImport: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
+    const sid = ctx.school.id, arr = (v, n) => (Array.isArray(v) ? v.slice(0, n) : []), uid = v => str(v, 120);
+    const undo = { classes: [], subjects: [], users: [], students: [], prev: { classes: [], subjects: [], users: [], students: [] } }, out = { added: 0, updated: 0, accounts: [], defaultMax: 0 };
+    const C = b.classes || {}, T = b.teachers || {}, S = b.subjects || {}, P = b.students || {};
+    const own = async (table, ids) => { ids = [...new Set(ids.map(int).filter(Boolean))]; if (!ids.length) return new Map(); const r = await q(`SELECT * FROM ${table} WHERE school_id=$1 AND id = ANY($2::int[])`, [sid, ids]); return new Map(r.map(x => [x.id, x])); };
+    // classes
+    const classRef = new Map(), have = await own('classes', arr(C.update, 2000).map(x => x.id));
+    for (const x of arr(C.add, 500)) {
+      const name = str(x.name, 40), stage = STAGES.includes(x.stage) ? x.stage : 'primary', section = SECTIONS.includes(x.section) ? x.section : 'en';
+      if (!name) continue;
+      const r = await one('INSERT INTO classes (school_id, name, stage, section, uid, sort) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id', [sid, name, stage, section, uid(x.uid), int(x.sort)]);
+      classRef.set(String(x.ref), r.id); undo.classes.push(r.id); out.added++;
+    }
+    for (const x of arr(C.update, 2000)) {
+      const old = have.get(int(x.id)); if (!old) continue;
+      const name = x.name ? str(x.name, 40) : old.name, id2 = x.uid && !old.uid ? uid(x.uid) : old.uid;
+      if (name === old.name && id2 === old.uid) continue;
+      undo.prev.classes.push({ id: old.id, name: old.name, uid: old.uid });
+      await q('UPDATE classes SET name=$1, uid=$2 WHERE id=$3 AND school_id=$4', [name, id2, old.id, sid]); if (name !== old.name) out.updated++;
+    }
+    const cls = async ref => { if (ref == null || ref === '') return 0; if (classRef.has(String(ref))) return classRef.get(String(ref)); const r = await one('SELECT id FROM classes WHERE id=$1 AND school_id=$2', [int(ref), sid]); return r ? r.id : 0; };
+    // teachers: an account each, with a temporary password to hand over
+    const teacherRef = new Map(), taken = new Set((await q('SELECT username FROM users WHERE school_id=$1', [sid])).map(r => r.username));
+    let seq = 101; const username = en => { let base = str(en, 40).toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, '.').replace(/^\.+|\.+$/g, '').slice(0, 30);
+      if (base.length >= 3 && !taken.has(base)) { taken.add(base); return base; }
+      if (base.length >= 3) for (let i = 2; i < 100; i++) if (!taken.has(base + i)) { taken.add(base + i); return base + i; }
+      while (taken.has('t' + seq)) seq++; taken.add('t' + seq); return 't' + seq; };
+    for (const x of arr(T.add, 1000)) {
+      const name = str(x.name, 80); if (!name) continue;
+      const pw = H.code(8), un = username(x.nameEn);
+      const r = await one(`INSERT INTO users (school_id, username, name, role, pass_hash, must_change, uid) VALUES ($1,$2,$3,'teacher',$4,true,$5) RETURNING id`, [sid, un, name, H.hashPassword(pw), uid(x.uid)]);
+      teacherRef.set(String(x.ref), r.id); undo.users.push(r.id); out.added++; out.accounts.push({ name, username: un, password: pw });
+    }
+    const haveU = await own('users', arr(T.update, 2000).map(x => x.id));
+    for (const x of arr(T.update, 2000)) {
+      const old = haveU.get(int(x.id)); if (!old) continue;
+      const name = x.name ? str(x.name, 80) : old.name, id2 = x.uid && !old.uid ? uid(x.uid) : old.uid;
+      if (name === old.name && id2 === old.uid) continue;
+      undo.prev.users.push({ id: old.id, name: old.name, uid: old.uid });
+      await q('UPDATE users SET name=$1, uid=$2 WHERE id=$3 AND school_id=$4', [name, id2, old.id, sid]); if (name !== old.name) out.updated++;
+    }
+    const tea = async ref => { if (ref == null || ref === '') return null; if (teacherRef.has(String(ref))) return teacherRef.get(String(ref)); const r = await one(`SELECT id FROM users WHERE id=$1 AND school_id=$2 AND role IN ('teacher','admin')`, [int(ref), sid]); return r ? r.id : null; };
+    // subjects: one row per class; a new row starts at 100 (pass 50) until the principal sets its full mark
+    for (const x of arr(S.add, 5000)) {
+      const c = await cls(x.classRef), name = str(x.name, 60); if (!c || !name) continue;
+      const dup = await one('SELECT id FROM subjects WHERE class_id=$1 AND lower(name)=lower($2)', [c, name]); if (dup) continue;
+      const max = num(x.max) > 0 ? num(x.max) : 100, min = num(x.max) > 0 ? Math.round(num(x.max) / 2 * 100) / 100 : 50;
+      const r = await one(`INSERT INTO subjects (school_id, class_id, name, max, min, teacher_id, uid, kind, sort) VALUES ($1,$2,$3,$4,$5,$6,$7,'mark',$8) RETURNING id`, [sid, c, name, max, min, await tea(x.teacherRef), uid(x.uid), int(x.sort)]);
+      undo.subjects.push(r.id); out.added++; if (!(num(x.max) > 0)) out.defaultMax++;
+    }
+    const haveS = await own('subjects', arr(S.update, 5000).map(x => x.id));
+    for (const x of arr(S.update, 5000)) {
+      const old = haveS.get(int(x.id)); if (!old) continue;
+      const name = x.name ? str(x.name, 60) : old.name, id2 = x.uid && !old.uid ? uid(x.uid) : old.uid, t = old.teacher_id || (x.teacherRef != null ? await tea(x.teacherRef) : null);
+      if (name === old.name && id2 === old.uid && t === old.teacher_id) continue;
+      undo.prev.subjects.push({ id: old.id, name: old.name, uid: old.uid, teacher_id: old.teacher_id });
+      await q('UPDATE subjects SET name=$1, uid=$2, teacher_id=$3 WHERE id=$4 AND school_id=$5', [name, id2, t, old.id, sid]); if (name !== old.name || t !== old.teacher_id) out.updated++;
+    }
+    // students, in one statement for the new ones
+    const add = { c: [], n: [], no: [], u: [] };
+    for (const x of arr(P.add, 20000)) { const c = await cls(x.classRef), name = str(x.name, 120); if (!c || !name) continue; add.c.push(c); add.n.push(name); add.no.push(str(x.number, 30)); add.u.push(uid(x.uid)); }
+    if (add.c.length) { const r = await q('INSERT INTO students (school_id, class_id, name, number, uid) SELECT $1, * FROM unnest($2::int[], $3::text[], $4::text[], $5::text[]) RETURNING id', [sid, add.c, add.n, add.no, add.u]); r.forEach(x => undo.students.push(x.id)); out.added += r.length; }
+    const haveP = await own('students', arr(P.update, 20000).map(x => x.id)), upd = { id: [], c: [], n: [], no: [], u: [] };
+    for (const x of arr(P.update, 20000)) {
+      const old = haveP.get(int(x.id)); if (!old) continue;
+      const c = x.classRef != null && x.classRef !== '' ? (await cls(x.classRef)) || old.class_id : old.class_id, name = x.name ? str(x.name, 120) : old.name, no = x.number ? str(x.number, 30) : old.number, id2 = x.uid && !old.uid ? uid(x.uid) : old.uid;
+      if (c === old.class_id && name === old.name && no === old.number && id2 === old.uid) continue;
+      undo.prev.students.push({ id: old.id, class_id: old.class_id, name: old.name, number: old.number, uid: old.uid });
+      upd.id.push(old.id); upd.c.push(c); upd.n.push(name); upd.no.push(no); upd.u.push(id2); if (c !== old.class_id || name !== old.name || no !== old.number) out.updated++;
+    }
+    if (upd.id.length) await q('UPDATE students s SET class_id=x.c, name=x.n, number=x.no, uid=x.u FROM unnest($1::int[], $2::int[], $3::text[], $4::text[], $5::text[]) AS x(id, c, n, no, u) WHERE s.id=x.id AND s.school_id=$6', [upd.id, upd.c, upd.n, upd.no, upd.u, sid]);
+    const r = await one('INSERT INTO suite_imports (school_id, user_id, undo) VALUES ($1,$2,$3::jsonb) RETURNING id', [sid, ctx.user.id, JSON.stringify(undo)]);
+    await audit(ctx, 'suiteImport', { id: r.id, added: out.added, updated: out.updated, from: str(b.from, 60) });
+    return Object.assign(out, { importId: r.id });
+  } },
+  // Undo puts back what the import changed and removes what it added, unless marks were entered on it since.
+  suiteUndo: { roles: ['admin'], sys: true, write: true, async run(ctx, b) {
+    const sid = ctx.school.id, row = await one('SELECT * FROM suite_imports WHERE id=$1 AND school_id=$2 AND NOT undone', [int(b.id), sid]);
+    if (!row) throw new Fail(404, 'import');
+    const u = row.undo || {}, ids = k => (Array.isArray(u[k]) ? u[k].map(int) : []), prev = k => (u.prev && Array.isArray(u.prev[k]) ? u.prev[k] : []);
+    const used = await one('SELECT count(*)::int AS n FROM marks WHERE student_id = ANY($1::int[]) OR subject_id = ANY($2::int[])', [ids('students'), ids('subjects')]);
+    if (used && used.n) throw new Fail(409, 'marks_entered');
+    for (const p of prev('students')) await q('UPDATE students SET class_id=$1, name=$2, number=$3, uid=$4 WHERE id=$5 AND school_id=$6', [int(p.class_id), p.name, p.number || '', p.uid || '', int(p.id), sid]);
+    for (const p of prev('subjects')) await q('UPDATE subjects SET name=$1, uid=$2, teacher_id=$3 WHERE id=$4 AND school_id=$5', [p.name, p.uid || '', p.teacher_id || null, int(p.id), sid]);
+    for (const p of prev('users')) await q('UPDATE users SET name=$1, uid=$2 WHERE id=$3 AND school_id=$4', [p.name, p.uid || '', int(p.id), sid]);
+    for (const p of prev('classes')) await q('UPDATE classes SET name=$1, uid=$2 WHERE id=$3 AND school_id=$4', [p.name, p.uid || '', int(p.id), sid]);
+    if (ids('students').length) await q('DELETE FROM students WHERE school_id=$1 AND id = ANY($2::int[])', [sid, ids('students')]);
+    if (ids('subjects').length) await q('DELETE FROM subjects WHERE school_id=$1 AND id = ANY($2::int[])', [sid, ids('subjects')]);
+    if (ids('classes').length) await q('DELETE FROM classes WHERE school_id=$1 AND id = ANY($2::int[]) AND NOT EXISTS (SELECT 1 FROM students s WHERE s.class_id=classes.id)', [sid, ids('classes')]);
+    if (ids('users').length) await q(`DELETE FROM users WHERE school_id=$1 AND id = ANY($2::int[]) AND role='teacher' AND id<>$3`, [sid, ids('users'), ctx.user.id]);
+    await q('UPDATE suite_imports SET undone=true WHERE id=$1', [row.id]); await audit(ctx, 'suiteUndo', { id: row.id });
+    return { ok: true };
+  } },
+
   // ----- marks -----
   // Teachers write their own subjects until they send them; after that only the principal changes a mark (and it is logged).
   saveMarks: { roles: ['teacher', 'admin'], write: true, async run(ctx, b) {
